@@ -1,4 +1,6 @@
 아래는 **WideResNet** 모델을 포함한 GitHub 리드미 파일 예시입니다. 제목에 `WideResNet`을 추가하여 코드와 관련된 내용을 강조한 버전입니다.
+![image](https://github.com/user-attachments/assets/6083e29c-78a7-44c7-b1ac-8102de9b998d)
+![image](https://github.com/user-attachments/assets/d0f306db-ab40-489f-8a6b-94e6df676272)
 
 ---
 
