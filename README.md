@@ -143,3 +143,209 @@ cifar10-wide-resnet/
 ---
 
 이 리드미 파일은 프로젝트의 목적과 기능, 실행 방법을 간결하고 명확하게 설명하며, `WideResNet` 모델을 중심으로 분산 학습을 구현하는 방법을 설명합니다.
+
+이 코드는 분산 학습을 사용하여 CIFAR-10 데이터셋에 대해 **WideResNet** 모델을 훈련시키는 PyTorch 코드입니다. 각 줄의 주요 역할에 대해 설명하겠습니다.
+
+---
+
+### 1-6: Importing Libraries
+```python
+import argparse
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
+import time
+from torch.utils.data import DataLoader
+from assessment_print import assessment_print
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+```
+필요한 라이브러리들을 임포트합니다.
+- `argparse`: 명령줄 인자 파싱을 위한 라이브러리.
+- `torch`와 `torch.nn`: PyTorch의 기본 라이브러리 및 신경망 모듈.
+- `torchvision`: CIFAR-10 데이터셋과 모델을 다루는 라이브러리.
+- `transforms`: 이미지 전처리를 위한 라이브러리.
+- `time`: 시간을 측정하는 라이브러리.
+- `DataLoader`: 데이터를 배치 단위로 로딩하는 기능.
+- `assessment_print`: 맞춤형 출력 함수 (예를 들어 학습 진행 상황 출력).
+- `torch.distributed`: 분산 학습을 위한 모듈.
+- `DistributedDataParallel`: 분산 GPU 학습을 위한 DDP 모델.
+
+---
+
+### 8-15: Argument Parsing
+```python
+parser = argparse.ArgumentParser(description='Workshop Assessment',
+                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('--node-id', type=int, default=0, help='Node ID for distributed training')
+parser.add_argument('--num-gpus', type=int, default=4, help='Number of GPUs to use')
+parser.add_argument('--num-nodes', type=int, default=1, help='Number of nodes to use')
+parser.add_argument('--batch-size', type=int, default=128, help='Input batch size for training')
+parser.add_argument('--epochs', type=int, default=40, help='Number of epochs to train')
+parser.add_argument('--base-lr', type=float, default=0.01, help='Learning rate for a single GPU')
+parser.add_argument('--target-accuracy', type=float, default=0.75, help='Target accuracy to stop training')
+parser.add_argument('--patience', type=int, default=2, help='Number of epochs that meet target before stopping')
+args = parser.parse_args()
+```
+명령줄 인자를 처리합니다. 이를 통해 사용자로부터 여러 파라미터를 받을 수 있습니다. 예를 들어, `--batch-size`로 배치 크기를 지정하거나, `--epochs`로 훈련할 에폭 수를 지정할 수 있습니다.
+
+---
+
+### 17-27: Convolutional Block (`cbrblock`)
+```python
+class cbrblock(nn.Module):
+    def __init__(self, input_channels, output_channels):
+        super(cbrblock, self).__init__()
+        self.cbr = nn.Sequential(
+            nn.Conv2d(input_channels, output_channels, kernel_size=3, stride=(1, 1), padding='same', bias=False),
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU()
+        )
+    def forward(self, x):
+        return self.cbr(x)
+```
+- `cbrblock` 클래스는 **Conv2D** -> **BatchNorm** -> **ReLU** 순서로 구성된 기본적인 합성곱 블록을 정의합니다.
+- `Conv2d`는 3x3 크기의 커널을 사용하여 이미지를 처리합니다.
+- `BatchNorm2d`는 배치 정규화를 적용하여 학습 안정성을 높입니다.
+- `ReLU`는 활성화 함수로 비선형성을 추가합니다.
+
+---
+
+### 29-39: Residual Block (`conv_block`)
+```python
+class conv_block(nn.Module):
+    def __init__(self, input_channels, output_channels, scale_input):
+        super(conv_block, self).__init__()
+        self.scale_input = scale_input
+        if self.scale_input:
+            self.scale = nn.Conv2d(input_channels, output_channels, kernel_size=1, stride=(1, 1), padding='same')
+        self.layer1 = cbrblock(input_channels, output_channels)
+        self.dropout = nn.Dropout(p=0.01)
+        self.layer2 = cbrblock(output_channels, output_channels)
+        
+    def forward(self, x):
+        residual = x
+        out = self.layer1(x)
+        out = self.dropout(out)
+        out = self.layer2(out)
+        if self.scale_input:
+            residual = self.scale(residual)
+        out = out + residual
+        return out
+```
+- `conv_block` 클래스는 **Residual Block**을 정의합니다. 입력과 출력을 더하는 **skip connection**을 포함한 블록입니다.
+- 두 개의 `cbrblock`을 거쳐서 출력을 만들고, `scale_input`이 참이면 입력 채널을 출력 채널 크기에 맞추는 **1x1 Convolution**을 추가합니다.
+- 마지막에 입력값 `x`와 출력을 더하여 **Residual Learning**을 구현합니다.
+
+---
+
+### 41-60: WideResNet Model
+```python
+class WideResNet(nn.Module):
+    def __init__(self, num_classes):
+        super(WideResNet, self).__init__()
+        nChannels = [3, 16, 160, 320, 640]
+        self.input_block = cbrblock(nChannels[0], nChannels[1])
+        self.block1 = conv_block(nChannels[1], nChannels[2], 1)
+        self.block2 = conv_block(nChannels[2], nChannels[2], 0)
+        self.pool1 = nn.MaxPool2d(2)
+        self.block3 = conv_block(nChannels[2], nChannels[3], 1)
+        self.block4 = conv_block(nChannels[3], nChannels[3], 0)
+        self.pool2 = nn.MaxPool2d(2)
+        self.block5 = conv_block(nChannels[3], nChannels[4], 1)
+        self.block6 = conv_block(nChannels[4], nChannels[4], 0)
+        self.pool = nn.AvgPool2d(7)
+        self.flat = nn.Flatten()
+        self.fc = nn.Linear(nChannels[4], num_classes)
+
+    def forward(self, x):
+        out = self.input_block(x)
+        out = self.block1(out)
+        out = self.block2(out)
+        out = self.pool1(out)
+        out = self.block3(out)
+        out = self.block4(out)
+        out = self.pool2(out)
+        out = self.block5(out)
+        out = self.block6(out)
+        out = self.pool(out)
+        out = self.flat(out)
+        out = self.fc(out)
+        return out
+```
+- `WideResNet`은 **Wide Residual Network**의 구현입니다.
+- 여러 `conv_block`과 **MaxPooling** 및 **Average Pooling**을 사용하여 이미지의 특징을 추출합니다.
+- 최종적으로 **Fully Connected Layer (fc)**를 사용하여 클래스 수 만큼 출력합니다.
+
+---
+
+### 62-65: Distributed Setup
+```python
+def setup(rank, world_size):
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)  # set device to match the rank
+```
+- **분산 학습**을 위한 초기화 함수입니다. `rank`와 `world_size`를 이용해 각 노드의 GPU가 올바르게 설정되도록 합니다.
+- `nccl` backend는 NVIDIA GPU 간 통신을 최적화한 라이브러리입니다.
+
+---
+
+### 67-70: Cleanup
+```python
+def cleanup():
+    dist.destroy_process_group()
+```
+- 분산 학습을 마친 후 리소스를 정리하는 함수입니다.
+
+---
+
+### 73-88: Training and Testing Functions
+```python
+def train(model, optimizer, train_loader, loss_fn, device):
+    # Training logic
+    ...
+def test(model, test_loader, loss_fn, device):
+    # Testing logic
+    ...
+```
+- `train`: 모델을 훈련하는 함수입니다. 주어진 데이터를 사용하여 모델을 학습하고, 학습된 모델로 예측을 수행한 후 정확도를 반환합니다.
+- `test`: 모델을 평가하는 함수입니다. 검증 데이터셋에 대해 모델을 평가하고, 정확도와 손실을 반환합니다.
+
+---
+
+### 90-104: DataLoader Setup
+```python
+def get_dataloaders(batch_size):
+    # 데이터 로딩 함수
+    ...
+```
+- CIFAR-10 데이터셋을 훈련 및 테스트 세트로 나누어 **DataLoader**로 반환합니다.
+- 데이터 증강 기법(`RandomHorizontalFlip`, `RandomRotation`, `RandomAffine`, `ColorJitter`)을 포함한 `transform_train`과, 정규화된 `transform_test`를 설정합니다.
+
+---
+
+### 106-132: Main Function
+```python
+if __name__ == '__main__':
+    # Main function for training and evaluation
+    ...
+```
+- **훈련**과 **평가**를 위한 메인 함수입니다.
+- `setup`: 분산 학습을 설정합니다 (다중 노드 및 다중 GPU).
+- 모델과 최적화 기법, 손실 함수 설정.
+- 훈련 및 테스트 루프를 통해 모델을 학습하고 평가합니다.
+- `early stopping` 조건을 만족하면 학습을 중지합니다.
+
+---
+
+### 134-136: Cleanup After Training
+```python
+if args.num_nodes > 1:
+    cleanup()
+```
+- 분산 학습을 사용한 경우, 학습 후 **process group**을 정리합니다.
+
+---
+
+이 코드는 분산 학습을 통해 CIFAR-10 데이터셋을 **WideResNet** 모델로 훈련하고 평가하는 과정을 구현한 것입니다.
